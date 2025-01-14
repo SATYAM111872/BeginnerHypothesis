@@ -117,7 +117,7 @@ class CAMDetector:
 
 def main():
     st.title("Surgical Instrument Detection")
-    st.write("Upload an image to detect surgical instruments in laparoscopic procedures")
+    st.write("Upload an image to detect surgical instruments")
     
     # Model loading
     @st.cache_resource
