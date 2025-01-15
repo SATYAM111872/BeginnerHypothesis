@@ -216,8 +216,8 @@ def main():
     
     # Initialize triplet mapper
     try:
-        triplet_mapper = TripletMapper(r"C:\Users\satya\OneDrive\Documents\GitHub\BH\triplet.txt", 
-                                     r"C:\Users\satya\OneDrive\Documents\GitHub\BH\maps.txt")
+        triplet_mapper = TripletMapper("triplet.txt", 
+                                     "maps.txt")
     except Exception as e:
         st.error(f"Error loading mapping files: {str(e)}")
         return
