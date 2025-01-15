@@ -233,7 +233,7 @@ def main():
         if uploaded_file is not None:
             image = Image.open(uploaded_file)
             img_array = np.array(image)
-            st.image(img_array, caption="Uploaded Image", use_container_width=True)
+            st.image(img_array, caption="Uploaded Image", use_column_width=True)
             
             confidence_threshold = st.slider(
                 "Detection Confidence Threshold", 
