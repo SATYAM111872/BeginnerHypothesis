@@ -6,8 +6,9 @@ import matplotlib.pyplot as plt
 from keras import layers
 import io
 from PIL import Image
+import tempfile
+from collections import defaultdict
 
-# Custom ULSAM Layer definition
 class ULSAMLayer(layers.Layer):
     def __init__(self, groups=8, **kwargs):
         super(ULSAMLayer, self).__init__(**kwargs)
@@ -32,6 +33,7 @@ class ULSAMLayer(layers.Layer):
         x = self.conv(x)
         return x
 
+
 class CAMDetector:
     def __init__(self, model, target_layer_name, img_size=(224, 224)):
         self.model = model
@@ -43,7 +45,6 @@ class CAMDetector:
         )
     
     def preprocess_image(self, img_array):
-        """Modified to accept numpy array instead of path"""
         img_array = cv2.resize(img_array, self.img_size)
         img_array = np.expand_dims(img_array, axis=0)
         img_array = img_array / 255.0
@@ -80,12 +81,10 @@ class CAMDetector:
         cam = self.generate_cam(img_tensor, class_idx)
         bbox = self.get_bounding_box(cam)
         
-        # Resize image for display
         original_img = cv2.resize(img_array, self.img_size)
         
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
         
-        # Original image with bbox
         ax1.imshow(original_img)
         if bbox:
             x, y, w, h = bbox
@@ -94,12 +93,10 @@ class CAMDetector:
         ax1.set_title('Detection')
         ax1.axis('off')
         
-        # CAM heatmap
         ax2.imshow(cam, cmap='jet')
         ax2.set_title('Class Activation Map')
         ax2.axis('off')
         
-        # Overlay
         cam_resized = cv2.resize(cam, self.img_size)
         heatmap = np.uint8(255 * cam_resized)
         heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
@@ -115,9 +112,92 @@ class CAMDetector:
         plt.tight_layout()
         return fig
 
+class TripletMapper:
+    def __init__(self, triplet_file, instrument_mapping_file):
+        self.triplet_names = self._load_triplet_names(triplet_file)
+        self.instrument_mappings = self._load_instrument_mappings(instrument_mapping_file)
+    
+    def _load_triplet_names(self, filepath):
+        triplet_dict = {}
+        with open(filepath, 'r') as f:
+            for line in f:
+                idx, triplet = line.strip().split(':')
+                triplet_dict[int(idx)] = triplet
+        return triplet_dict
+    
+    def _load_instrument_mappings(self, filepath):
+        mappings = []
+        with open(filepath, 'r') as f:
+            next(f)  # Skip header
+            for line in f:
+                values = [int(x) for x in line.strip().split(',')]
+                mappings.append(values)
+        return mappings
+    
+    def get_triplet_name(self, triplet_idx):
+        return self.triplet_names.get(triplet_idx, "Unknown Triplet")
+    
+    def get_instrument_idx(self, triplet_idx):
+        if triplet_idx < len(self.instrument_mappings):
+            return self.instrument_mappings[triplet_idx][1]
+        return None
+
+class VideoProcessor:
+    def __init__(self, model):
+        self.model = model
+    
+    def preprocess_frame(self, frame):
+        processed_frame = cv2.resize(frame, (224, 224))
+        processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+        processed_frame = processed_frame.astype(np.float32) / 255.0
+        return processed_frame
+    
+    def process_video(self, video_file, confidence_threshold, triplet_mapper):
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        temp_file.write(video_file.read())
+        temp_file.close()
+        
+        cap = cv2.VideoCapture(temp_file.name)
+        unique_detections = defaultdict(list)
+        frame_count = 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            processed_frame = self.preprocess_frame(frame)
+            model_input = np.expand_dims(processed_frame, axis=0)
+            predictions = self.model.predict(model_input, verbose=0)
+            
+            triplet_preds = predictions[1][0]
+            
+            for idx, confidence in enumerate(triplet_preds):
+                if confidence > confidence_threshold:
+                    triplet_name = triplet_mapper.get_triplet_name(idx)
+                    instrument_idx = triplet_mapper.get_instrument_idx(idx)
+                    detection_key = (triplet_name, instrument_idx)
+                    
+                    if confidence > max([conf for _, conf in unique_detections[detection_key]], default=0):
+                        unique_detections[detection_key] = [(frame_count, confidence)]
+            
+            frame_count += 1
+            progress = min(frame_count / total_frames, 1.0)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing frame {frame_count}/{total_frames}")
+        
+        cap.release()
+        progress_bar.empty()
+        status_text.empty()
+        
+        return unique_detections
+
 def main():
     st.title("Surgical Instrument Detection")
-    st.write("Upload an image to detect surgical instruments")
     
     # Model loading
     @st.cache_resource
@@ -134,56 +214,98 @@ def main():
         st.error(f"Error loading model: {str(e)}")
         return
     
-    # File uploader
-    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+    # Initialize triplet mapper
+    try:
+        triplet_mapper = TripletMapper(r"C:\Users\satya\OneDrive\Documents\GitHub\BH\triplet.txt", 
+                                     r"C:\Users\satya\OneDrive\Documents\GitHub\BH\maps.txt")
+    except Exception as e:
+        st.error(f"Error loading mapping files: {str(e)}")
+        return
+
+    # Input type selection
+    input_type = st.radio("Select input type:", ["Image(For visualisation feature)", "Video"])
     
-    if uploaded_file is not None:
-        # Read and display the uploaded image
-        image = Image.open(uploaded_file)
-        img_array = np.array(image)
-        st.image(img_array, caption="Uploaded Image", use_column_width=True)
+    instrument_classes = ['Grasper', 'Bipolar', 'Hook', 'Scissors', 'Clipper', 'Irrigator', "other"]
+    
+    if input_type == "Image(For visualisation feature)":
+        uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
         
-        # Add confidence threshold slider
-        confidence_threshold = st.slider(
-            "Detection Confidence Threshold", 
-            min_value=0.0, 
-            max_value=1.0, 
-            value=0.5, 
-            step=0.05
-        )
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
+            img_array = np.array(image)
+            st.image(img_array, caption="Uploaded Image", use_container_width=True)
+            
+            confidence_threshold = st.slider(
+                "Detection Confidence Threshold", 
+                min_value=0.0, 
+                max_value=1.0, 
+                value=0.5, 
+                step=0.05
+            )
+            
+            if st.button("Detect Instruments"):
+                detector = CAMDetector(model, target_layer_name='re_lu_34')
+                
+                processed_img = tf.image.resize(img_array, (224, 224))
+                processed_img = tf.cast(processed_img, tf.float32) / 255.0
+                predictions = model.predict(np.expand_dims(processed_img, axis=0))
+                
+                st.subheader("Detected Instruments:")
+                
+                triplet_preds = predictions[1][0]
+                detections_found = False
+                
+                for idx, confidence in enumerate(triplet_preds):
+                    if confidence > confidence_threshold:
+                        detections_found = True
+                        triplet_name = triplet_mapper.get_triplet_name(idx)
+                        instrument_idx = triplet_mapper.get_instrument_idx(idx)
+                        
+                        st.write(f"Triplet: {triplet_name} ({confidence:.2%} confidence)")
+                        if instrument_idx is not None:
+                            st.write(f"Instrument: {instrument_classes[instrument_idx]} ")
+                        
+                        fig = detector.visualize_detection(
+                            img_array,
+                            instrument_idx if instrument_idx is not None else 0,
+                            instrument_classes[instrument_idx] if instrument_idx is not None else "Unknown",
+                            confidence
+                        )
+                        st.pyplot(fig)
+                        plt.close(fig)
+                
+                if not detections_found:
+                    st.info("No instruments detected above the confidence threshold.")
+    
+    else:  # Video processing
+        uploaded_video = st.file_uploader("Choose a video...", type=["mp4", "avi", "mov"])
         
-        # Process button
-        if st.button("Detect Instruments"):
-            detector = CAMDetector(model, target_layer_name='re_lu_34')
-            instrument_classes = ['Grasper', 'Bipolar', 'Hook', 'Scissors', 'Clipper', 'Irrigator',"other"]
+        if uploaded_video is not None:
+            confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
             
-            # Get model predictions
-            processed_img = tf.image.resize(img_array, (224, 224))
-            processed_img = tf.cast(processed_img, tf.float32) / 255.0
-            predictions = model.predict(np.expand_dims(processed_img, axis=0))
-            
-            # Display predictions
-            st.subheader("Detected Instruments:")
-            
-            # Process detections
-            triplet_preds = predictions[1][0]
-            detections_found = False
-            
-            for idx, confidence in enumerate(triplet_preds):
-                if confidence > confidence_threshold:
-                    detections_found = True
-                    st.write(f"- {instrument_classes[idx]}: {confidence:.2%} confidence")
-                    fig = detector.visualize_detection(
-                        img_array,
-                        idx,
-                        instrument_classes[idx],
-                        confidence
-                    )
-                    st.pyplot(fig)
-                    plt.close(fig)
-            
-            if not detections_found:
-                st.info("No instruments detected above the confidence threshold.")
+            if st.button("Process Video"):
+                with st.spinner("Processing video..."):
+                    video_processor = VideoProcessor(model)
+                    unique_detections = video_processor.process_video(uploaded_video, confidence_threshold, triplet_mapper)
+                    
+                    st.subheader("Unique Detections Throughout Video:")
+                    
+                    if unique_detections:
+                        sorted_detections = sorted(
+                            unique_detections.items(),
+                            key=lambda x: x[1][0][1],
+                            reverse=True
+                        )
+                        
+                        for (triplet_name, instrument_idx), occurrences in sorted_detections:
+                            frame_num, confidence = occurrences[0]
+                            st.markdown(f"**Triplet Action:** {triplet_name}")
+                            if instrument_idx is not None:
+                                st.markdown(f"**Instrument:** {instrument_classes[instrument_idx]}")
+                            st.markdown(f"**Highest Confidence:** {confidence:.2%} (Frame {frame_num})")
+                            st.markdown("---")
+                    else:
+                        st.info("No detections above the confidence threshold.")
 
 if __name__ == "__main__":
     main()
